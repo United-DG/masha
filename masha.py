@@ -16,20 +16,28 @@ from aiogram.types import BufferedInputFile, BusinessConnection, InputStoryConte
 from dotenv import load_dotenv
 from PIL import Image, ImageFilter, ImageOps
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))  # always the .env next to this script
+
+
+def path_env(name: str, default: str) -> str:
+    """Resolve paths relative to the script folder, not the folder you launched it from."""
+    value = os.getenv(name, default)
+    return value if os.path.isabs(value) else os.path.join(BASE_DIR, value)
+
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_KEY = os.environ["GROQ_API_KEY"]
 OWNER_ID = int(os.environ["OWNER_ID"])  # your Telegram user id
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")  # chat replies
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.6-27b")  # story captions (needs image input)
-INSTRUCTIONS_FILE = os.getenv("INSTRUCTIONS_FILE", "instructions.md")
-STORY_INSTRUCTIONS_FILE = os.getenv("STORY_INSTRUCTIONS_FILE", "story_instructions.md")
-DB_FILE = os.getenv("DB_FILE", "memory.db")
+INSTRUCTIONS_FILE = path_env("INSTRUCTIONS_FILE", "instructions.md")
+STORY_INSTRUCTIONS_FILE = path_env("STORY_INSTRUCTIONS_FILE", "story_instructions.md")
+DB_FILE = path_env("DB_FILE", "memory.db")
 CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "40"))
 KEEP_PER_CHAT = int(os.getenv("KEEP_PER_CHAT", "500"))
 
-STORIES_DIR = os.getenv("STORIES_DIR", "stories")
+STORIES_DIR = path_env("STORIES_DIR", "stories")
 POSTED_DIR = os.path.join(STORIES_DIR, "posted")
 STORY_TIMES = [t.strip() for t in os.getenv("STORY_TIMES", "00:00,09:00").split(",") if t.strip()]
 UTC_OFFSET_HOURS = float(os.getenv("UTC_OFFSET_HOURS", "3"))  # GMT+3
@@ -175,7 +183,12 @@ async def caption_for(raw: bytes) -> str:
     return caption[:2000]
 
 
+def ensure_dirs() -> None:
+    os.makedirs(POSTED_DIR, exist_ok=True)  # also creates STORIES_DIR
+
+
 def list_images() -> list[str]:
+    ensure_dirs()  # every count/pick first makes sure the folders exist
     return [
         os.path.join(STORIES_DIR, f)
         for f in os.listdir(STORIES_DIR)
@@ -199,8 +212,36 @@ async def notify(text: str) -> None:
         print("notify failed:", e)
 
 
+async def resolve_connection_id() -> str | None:
+    """Try the saved id, then the .env id; keep the first one Telegram confirms is active."""
+    candidates = []
+    for cid in (get_setting("business_connection_id"), (os.getenv("BUSINESS_CONNECTION_ID") or "").strip()):
+        if cid and cid not in candidates:
+            candidates.append(cid)
+    if not candidates:
+        print("Business connection id: none saved and none in .env (waiting for a business update)")
+        return None
+    for cid in candidates:
+        try:
+            info = await bot.get_business_connection(business_connection_id=cid)
+        except Exception as e:
+            print(f"Business connection id {cid[:6]}...: could not verify ({e})")
+            continue
+        if info.is_enabled:
+            set_setting("business_connection_id", cid)
+            can_stories = getattr(info.rights, "can_manage_stories", None)
+            print(f"Business connection id verified: {cid[:6]}... | can_manage_stories: {can_stories}")
+            return cid
+        print(f"Business connection id {cid[:6]}... exists but is disabled")
+    # nothing verified (e.g. network hiccup): still keep the best candidate so posting can try
+    fallback = candidates[-1] if not get_setting("business_connection_id") else candidates[0]
+    set_setting("business_connection_id", fallback)
+    print("Business connection id: unverified, using", fallback[:6] + "...")
+    return fallback
+
+
 async def post_story(raw: bytes, caption: str | None) -> None:
-    conn = current_connection_id()
+    conn = current_connection_id() or await resolve_connection_id()
     if not conn:
         raise RuntimeError(
             "No business connection saved yet. Re-save the bot in Settings > Business > "
@@ -270,7 +311,7 @@ async def scheduler() -> None:
 
 # ---------- capture the business connection id from ANY business update ----------
 def current_connection_id() -> str | None:
-    return get_setting("business_connection_id") or os.getenv("BUSINESS_CONNECTION_ID") or None
+    return get_setting("business_connection_id") or (os.getenv("BUSINESS_CONNECTION_ID") or "").strip() or None
 
 
 @dp.update.outer_middleware()
@@ -319,6 +360,8 @@ async def story_cmd(message: Message, command: CommandObject):
             f"Times: {', '.join(STORY_TIMES)} (GMT{UTC_OFFSET_HOURS:+g})\n"
             f"Next: {nxt}\n"
             f"Images left: {len(list_images())}\n"
+            f"Stories folder: {STORIES_DIR}\n"
+            f"Database: {DB_FILE}\n"
             f"Business connection: {'saved' if current_connection_id() else 'MISSING'}"
         )
     else:
@@ -385,6 +428,9 @@ async def main():
         f"Auto stories: {get_setting('auto_stories', 'on').upper()} ({', '.join(STORY_TIMES)})\n"
         "Send /story status for details."
     )
+    print(f"Stories folder: {STORIES_DIR} | images found: {len(list_images())}")
+    await resolve_connection_id()
+    print(f"Database: {DB_FILE} | connection id: {'yes' if current_connection_id() else 'MISSING'}")
     me = await bot.me()
     hook = await bot.get_webhook_info()
     print(f"Bot: @{me.username} | business mode on: {getattr(me, 'can_connect_to_business', None)}")
